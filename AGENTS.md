@@ -149,10 +149,17 @@ AudioExtractor.download(audioBlob, filename)
   - 输出：Promise<void> 下载完成
 ```
 
-**实现要点**：
-- 使用 MediaRecorder API 录制音频
-- 处理不同音频格式（MP3、WAV、WebM）
-- 监听录制进度和错误
+**实现要点（参考 Bilibili-Evolved 逻辑）**：
+- **优先方案：DASH 音频流提取**
+  - 从 `window.__playinfo__` 获取 DASH 数据
+  - 解析 `dash.audio` 数组，选择最高质量的音频流（`bandwidth` 最大）
+  - 获取 `baseUrl` 和 `backupUrl`
+  - 使用 `GM_xmlhttpRequest` 下载音频流（需处理 Referer 防盗链）
+- **降级方案：MediaRecorder 录制**
+  - 如果无法获取 DASH 数据，回退到 MediaRecorder 录制当前播放音频
+- **通用处理**
+  - 统一输出 Blob 对象
+  - 处理下载进度和错误
 
 ### 2. CacheManager（缓存管理模块）
 
