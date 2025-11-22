@@ -1,169 +1,87 @@
 # B 站视频自动字幕脚本
 
-一个基于 Tampermonkey 的用户脚本，为 B 站视频自动生成字幕。通过提取视频音频、调用 AI 接口进行语音识别，并自动将字幕添加到视频播放器中。
+一个基于 Tampermonkey 的用户脚本，为 B 站视频自动生成字幕。通过提取视频音频、调用 **腾讯云录音识别极速版 API** 进行语音识别，并自动将字幕渲染到视频播放器中。
 
 ## 功能特性
 
-### 1. 音频提取
-- 从当前正在观看的 B 站视频页面提取音频文件
-- **高质量音频**：优先尝试从 B 站 DASH 接口直接下载无损音频流（参考 Bilibili-Evolved 实现逻辑）
-- 支持两种存储方式：
-  - **本地下载**：直接保存到用户下载目录
-  - **浏览器缓存**：存储在浏览器 IndexedDB 中，便于快速访问
-- 智能缓存管理：缓存超过 100MB 时自动清除最早的缓存文件
+### 1. 智能音频提取
+- **高质量音源**：优先解析 B 站 DASH 接口，直接获取无损 M4A 音频流，确保最佳识别效果。
+- **智能缓存**：使用浏览器 IndexedDB 缓存音频文件（上限 100MB），避免重复下载，节省流量。
 
-### 2. AI 字幕识别
-- 抽象的 AI 接口设计，支持多种语音识别服务
-- 自动将音频文件转换为 SRT 格式字幕
-- 可配置的 API 接口，方便切换不同的 AI 服务提供商
+### 2. AI 极速识别
+- **腾讯云对接**：集成腾讯云录音文件识别极速版 API，识别速度快（通常 30 分钟音频仅需 10 秒）。
+- **智能断句**：
+  - 采用 **词级重组算法**，将长语音流拆分为适合阅读的短句。
+  - 基于**标点符号**、**自然停顿 (>500ms)** 和**字符长度 (20字)** 进行智能切分。
+  - 确保每行字幕简短、语义完整，避免大段文字遮挡画面。
 
-### 3. 字幕显示
-- 自动将生成的字幕添加到当前视频窗口
-- 与 B 站原生字幕系统集成
-- 支持字幕样式自定义
+### 3. 原生级字幕渲染
+- **沉浸式体验**：复刻 B 站原生 CC 字幕样式（半透明黑底、白色文字、阴影效果）。
+- **自适应布局**：字幕大小随播放器宽度自动缩放，完美适配全屏、宽屏和小窗模式。
+- **精准同步**：基于 `requestAnimationFrame` 实现毫秒级时间轴同步。
 
 ## 安装方法
 
 ### 前置要求
-- 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展
-  - [Chrome 版本](https://chrome.google.com/webstore/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo)
-  - [Firefox 版本](https://addons.mozilla.org/firefox/addon/tampermonkey/)
-  - [Edge 版本](https://microsoftedge.microsoft.com/addons/detail/tampermonkey/iikmkjmpaadaobahmlepeloendndfphd)
+- 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展。
+- 注册 [腾讯云账号](https://cloud.tencent.com/) 并开通 [录音文件识别极速版](https://cloud.tencent.com/product/flash-asr)（新用户通常有免费额度）。
 
 ### 安装步骤
-1. 安装 Tampermonkey 扩展
-2. 打开 Tampermonkey 管理面板
-3. 点击"创建新脚本"
-4. 将 `bilibili-auto-subtitle.user.js` 文件内容复制到编辑器中
-5. 保存脚本（Ctrl+S）
-6. 刷新 B 站视频页面
+1. 安装 Tampermonkey 扩展。
+2. 创建新脚本，将 `bilibili-auto-subtitle.user.js` 内容复制进去。
+3. 保存脚本并刷新 B 站视频页面。
+4. **首次使用配置**：
+   - 脚本会自动弹出配置面板。
+   - 填入您的腾讯云 `APPID`, `SECRET_ID`, `SECRET_KEY`。
+   - 点击"保存"，密钥将安全存储在浏览器本地。
+   - *注意：密钥仅存储在您的浏览器中，不会上传到任何服务器。*
 
 ## 使用说明
 
-### 基本使用流程
-
-1. **打开 B 站视频页面**
-   - 访问任意 B 站视频播放页面
-   - 脚本会自动检测并加载
-
-2. **提取音频**
-   - 点击视频播放器上的"提取音频"按钮（脚本添加）
-   - 选择存储方式：本地下载或浏览器缓存
-   - 等待音频提取完成
-
-3. **生成字幕**
-   - 音频提取完成后，点击"生成字幕"按钮
-   - 脚本会自动调用配置的 AI 接口
-   - 等待字幕生成（根据音频长度可能需要几分钟）
-
-4. **查看字幕**
-   - 字幕生成后会自动添加到视频播放器
-   - 可以在 B 站字幕设置中切换显示/隐藏
-
-### 高级功能
-
-- **缓存管理**：在脚本设置中可以查看和管理缓存文件
-- **批量处理**：支持为播放列表中的多个视频批量生成字幕
-- **字幕导出**：可以将生成的字幕导出为独立的 SRT 文件
+1. **打开视频**：访问任意 B 站视频页，右侧会出现"B站自动字幕"悬浮面板。
+2. **配置密钥**（首次使用）：点击"⚙️ 设置"按钮，输入腾讯云 API 密钥并保存。
+3. **提取音频**：点击"提取音频"，脚本会自动下载并缓存音频。
+4. **生成字幕**：下载完成后点击"生成字幕 (腾讯云 AI)"，脚本将上传音频并获取字幕。
+5. **观看视频**：字幕生成后会自动加载，随视频播放同步显示。
 
 ## 配置说明
 
-### AI API 配置
+### 腾讯云 API 配置
 
-脚本使用抽象的 AI 接口设计，需要配置具体的 AI 服务提供商。在脚本顶部找到配置区域：
+脚本提供了**可视化配置界面**，无需修改代码：
 
-```javascript
-// AI 接口配置
-const AI_CONFIG = {
-  // 接口类型：'openai' | 'aliyun' | 'custom'
-  provider: 'custom',
-  
-  // API 端点
-  endpoint: 'https://your-api-endpoint.com/transcribe',
-  
-  // API Key（建议使用 Tampermonkey 的存储功能）
-  apiKey: '',
-  
-  // 其他配置参数
-  language: 'zh-CN',
-  format: 'srt'
-};
-```
+1. 点击悬浮面板上的"⚙️ 设置"按钮。
+2. 在弹出的配置窗口中填入以下信息：
+   - **APPID**：腾讯云账号 APPID
+   - **SECRET_ID**：API 密钥 ID
+   - **SECRET_KEY**：API 密钥 Key（输入时会隐藏显示）
+3. 点击"保存"完成配置。
 
-### 支持的 AI 服务
+### 获取密钥
+1. 访问 [腾讯云 API 密钥管理](https://console.cloud.tencent.com/cam/capi)。
+2. 新建密钥，获取 `SecretId` 和 `SecretKey`。
+3. 访问 [账号信息](https://console.cloud.tencent.com/developer) 获取 `APPID`。
 
-- **OpenAI Whisper API**：需要 OpenAI API Key
-- **阿里云智能语音**：需要阿里云 AccessKey
-- **自定义接口**：实现标准接口规范即可接入
-
-### 存储配置
-
-- **缓存大小限制**：默认 100MB，可在配置中修改
-- **缓存清理策略**：FIFO（先进先出）
-- **本地存储位置**：浏览器默认下载目录
+### 安全性说明
+- 密钥通过 Tampermonkey 的 `GM_setValue` API 存储在浏览器本地。
+- 数据不会上传到任何第三方服务器。
+- 您可以随时通过"设置"按钮修改或更新密钥。
 
 ## 技术架构
 
-### 项目结构
-
-```
-auto-subtitle/
-├── README.md                      # 用户文档
-├── AGENTS.md                      # 开发文档
-└── bilibili-auto-subtitle.user.js # 主脚本文件
-```
-
-### 单文件架构
-
-虽然项目是单个 `.user.js` 文件，但内部采用模块化设计：
-
-- **AudioExtractor**：音频提取模块
-- **CacheManager**：缓存管理模块
-- **AISubtitleService**：AI 接口抽象层
-- **SubtitleRenderer**：字幕渲染模块
-
-### 浏览器 API 依赖
-
-- **MediaRecorder API**：用于音频录制
-- **IndexedDB API**：用于浏览器缓存存储
-- **Fetch API**：用于网络请求
-- **File System Access API**：用于本地文件保存（可选）
-
-## 依赖说明
-
-### 浏览器要求
-- Chrome 90+ / Edge 90+ / Firefox 88+
-- 支持 ES6+ 语法
-- 支持 IndexedDB
-
-### 外部依赖
-- 无外部 JavaScript 库依赖
-- 仅依赖浏览器原生 API
-- AI 服务通过 HTTP/HTTPS 调用
-
-## 注意事项
-
-1. **API 费用**：使用 AI 接口可能产生费用，请根据服务商定价合理使用
-2. **隐私安全**：音频文件会发送到配置的 AI 服务，请注意隐私保护
-3. **跨域限制**：某些 AI 服务可能需要配置 CORS，或使用代理
-4. **存储限制**：浏览器缓存受 IndexedDB 配额限制（通常为可用磁盘空间的 50%）
+- **音频提取**：解析 `window.__playinfo__` 获取 DASH 音频流。
+- **缓存层**：`CacheManager` 模块封装 IndexedDB，实现 FIFO 缓存淘汰策略。
+- **识别层**：`TencentCloudProvider` 实现 HMAC-SHA1 签名鉴权（纯 JS 实现，无外部依赖），直接调用腾讯云 REST API。
+- **解析层**：`SRTParser` 负责解析字幕，`SubtitleRenderer` 负责 DOM 渲染。
 
 ## 常见问题
 
-### Q: 脚本无法提取音频？
-A: 检查浏览器是否支持 MediaRecorder API，并确保视频已开始播放。
+### Q: 为什么提示“签名错误 (4002)”？
+A: 请检查脚本中的 `APPID`, `SECRET_ID`, `SECRET_KEY` 是否正确，且没有多余空格。确保您的腾讯云账号已开通语音识别服务。
 
-### Q: 字幕生成失败？
-A: 检查 AI API 配置是否正确，API Key 是否有效，网络连接是否正常。
-
-### Q: 缓存占用空间过大？
-A: 可以在脚本设置中手动清理缓存，或调整缓存大小限制。
+### Q: 字幕时间对不上？
+A: 脚本已内置时间戳修正逻辑。如果仍有偏差，可能是网络延迟或音频文件版本问题，尝试点击“重新生成”或刷新页面。
 
 ## 许可证
 
 MIT License
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
