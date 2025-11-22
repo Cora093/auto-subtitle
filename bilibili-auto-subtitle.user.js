@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站自动字幕
 // @namespace    http://tampermonkey.net/
-// @version      0.2.1
-// @description  为B站视频自动生成字幕，支持提取音频、AI识别、字幕缓存和字幕显示
+// @version      0.3.0
+// @description  为B站视频自动生成字幕，支持提取音频、AI识别、字幕缓存、长视频压缩和字幕显示
 // @author       You
 // @match        https://www.bilibili.com/video/*
 // @icon         https://www.bilibili.com/favicon.ico
@@ -11,6 +11,8 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
+// @require      https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.min.js
+// @require      https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.min.js
 // @run-at       document-end
 // ==/UserScript==
 
@@ -137,7 +139,127 @@
     })();
 
     // ==========================================
-    // 模块 2: CacheManager (缓存管理模块)
+    // 模块 2: AudioCompressor (音频压缩模块)
+    // ==========================================
+    const AudioCompressor = (function() {
+        const MAX_SIZE = 50 * 1024 * 1024; // 50MB 腾讯云 API 限制
+        const MAX_DURATION = 2 * 3600; // 2 小时
+        
+        let _ffmpeg = null;
+        let _isLoaded = false;
+
+        async function _loadFFmpeg(onProgress) {
+            if (_isLoaded && _ffmpeg) return _ffmpeg;
+            
+            try {
+                // 使用 @ffmpeg/ffmpeg (v0.12.x)
+                const { FFmpeg } = FFmpegWASM;
+                const { toBlobURL, fetchFile } = FFmpegUtil;
+                
+                _ffmpeg = new FFmpeg();
+                
+                _ffmpeg.on('log', ({ message }) => {
+                    console.log('[FFmpeg]', message);
+                });
+                
+                if (onProgress) {
+                    _ffmpeg.on('progress', ({ progress, time }) => {
+                        onProgress(Math.round(progress * 100));
+                    });
+                }
+                
+                console.log('[AudioCompressor] 正在加载 FFmpeg WASM...');
+                const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+                
+                await _ffmpeg.load({
+                    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+                    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+                });
+                
+                _isLoaded = true;
+                console.log('[AudioCompressor] FFmpeg 加载完成');
+                return _ffmpeg;
+            } catch (e) {
+                console.error('[AudioCompressor] FFmpeg 加载失败:', e);
+                throw new Error('FFmpeg 加载失败: ' + e.message);
+            }
+        }
+
+        async function _compressAudio(audioBlob, filename, onProgress) {
+            const ffmpeg = await _loadFFmpeg(onProgress);
+            
+            try {
+                console.log('[AudioCompressor] 开始压缩音频...');
+                
+                // 写入输入文件
+                const { fetchFile } = FFmpegUtil;
+                await ffmpeg.writeFile('input.m4a', await fetchFile(audioBlob));
+                
+                // 压缩参数：
+                // - 转换为 opus 编码（更高压缩率）
+                // - 降低比特率到 32kbps（语音识别足够）
+                // - 单声道
+                // - 采样率 16kHz（匹配 16k_zh 引擎）
+                await ffmpeg.exec([
+                    '-i', 'input.m4a',
+                    '-vn',                    // 去除视频流
+                    '-c:a', 'libopus',        // 使用 opus 编码
+                    '-b:a', '32k',            // 比特率 32kbps
+                    '-ac', '1',               // 单声道
+                    '-ar', '16000',           // 采样率 16kHz
+                    '-f', 'opus',             // 输出格式
+                    'output.opus'
+                ]);
+                
+                // 读取输出文件
+                const data = await ffmpeg.readFile('output.opus');
+                const compressedBlob = new Blob([data.buffer], { type: 'audio/opus' });
+                
+                // 清理临时文件
+                await ffmpeg.deleteFile('input.m4a');
+                await ffmpeg.deleteFile('output.opus');
+                
+                const compressionRatio = ((1 - compressedBlob.size / audioBlob.size) * 100).toFixed(1);
+                console.log(`[AudioCompressor] 压缩完成: ${(audioBlob.size / 1024 / 1024).toFixed(1)}MB -> ${(compressedBlob.size / 1024 / 1024).toFixed(1)}MB (节省 ${compressionRatio}%)`);
+                
+                return {
+                    blob: compressedBlob,
+                    filename: filename.replace('.m4a', '.opus'),
+                    originalSize: audioBlob.size,
+                    compressedSize: compressedBlob.size,
+                    compressionRatio: compressionRatio
+                };
+            } catch (e) {
+                console.error('[AudioCompressor] 压缩失败:', e);
+                throw new Error('音频压缩失败: ' + e.message);
+            }
+        }
+
+        function _needsCompression(audioBlob) {
+            return audioBlob.size > MAX_SIZE;
+        }
+
+        return {
+            needsCompression: _needsCompression,
+            
+            compress: async function(audioBlob, filename, onProgress) {
+                if (!this.needsCompression(audioBlob)) {
+                    console.log('[AudioCompressor] 文件大小正常，无需压缩');
+                    return { blob: audioBlob, filename: filename };
+                }
+                
+                console.log(`[AudioCompressor] 文件过大 (${(audioBlob.size / 1024 / 1024).toFixed(1)}MB)，开始压缩...`);
+                return await _compressAudio(audioBlob, filename, onProgress);
+            },
+            
+            getMaxSize: () => MAX_SIZE,
+            
+            isLoaded: () => _isLoaded
+        };
+    })();
+
+    // ==========================================
+    // 模块 3: CacheManager (缓存管理模块)
     // ==========================================
     const CacheManager = (function() {
         const DB_NAME = 'BilibiliSubtitleCache';
@@ -266,7 +388,7 @@
     })();
 
     // ==========================================
-    // 模块 3: AISubtitleService (AI 接口服务)
+    // 模块 4: AISubtitleService (AI 接口服务)
     // ==========================================
     const AISubtitleService = (function() {
         
@@ -299,7 +421,7 @@
         const TencentCloudProvider = {
             name: 'tencent',
             
-            transcribe: async function(audioBlob) {
+            transcribe: async function(audioBlob, voiceFormat = 'm4a') {
                 // 从 ConfigManager 读取配置
                 const config = ConfigManager.get();
                 
@@ -308,7 +430,7 @@
                     secretid: config.SECRET_ID,
                     engine_type: config.ENGINE_TYPE,
                     timestamp: timestamp,
-                    voice_format: 'm4a', 
+                    voice_format: voiceFormat, 
                     speaker_diarization: 0,
                     filter_dirty: 0,
                     filter_modal: 0,
@@ -437,18 +559,58 @@
         let _currentProvider = TencentCloudProvider; 
 
         return {
-            transcribe: async function(audioBlob) {
+            transcribe: async function(audioBlob, onProgress) {
                 if (!_currentProvider) throw new Error('未设置 AI 提供者');
                 if (!ConfigManager.isConfigured()) {
                     throw new Error('请先配置腾讯云 API 密钥');
                 }
-                return _currentProvider.transcribe(audioBlob);
+                
+                // 检查文件大小，如果超过限制则压缩
+                let finalBlob = audioBlob;
+                let voiceFormat = 'm4a';
+                
+                if (AudioCompressor.needsCompression(audioBlob)) {
+                    console.log('[AISubtitleService] 检测到大文件，启动压缩流程...');
+                    if (onProgress) {
+                        onProgress({ type: 'compress', message: '正在加载压缩引擎...' });
+                    }
+                    
+                    const result = await AudioCompressor.compress(
+                        audioBlob, 
+                        'audio.m4a',
+                        (percent) => {
+                            if (onProgress) {
+                                onProgress({ 
+                                    type: 'compress', 
+                                    message: `正在压缩音频: ${percent}%`,
+                                    percent: percent
+                                });
+                            }
+                        }
+                    );
+                    
+                    finalBlob = result.blob;
+                    voiceFormat = result.filename.endsWith('.opus') ? 'opus' : 'm4a';
+                    
+                    if (onProgress) {
+                        onProgress({ 
+                            type: 'compress_done', 
+                            message: `压缩完成，节省 ${result.compressionRatio}%`
+                        });
+                    }
+                }
+                
+                if (onProgress) {
+                    onProgress({ type: 'upload', message: '正在上传到腾讯云...' });
+                }
+                
+                return _currentProvider.transcribe(finalBlob, voiceFormat);
             }
         };
     })();
 
     // ==========================================
-    // 模块 4: SRTParser (SRT 解析器)
+    // 模块 5: SRTParser (SRT 解析器)
     // ==========================================
     const SRTParser = {
         parse: function(srtContent) {
@@ -485,7 +647,7 @@
     };
 
     // ==========================================
-    // 模块 5: SubtitleRenderer (字幕渲染模块)
+    // 模块 6: SubtitleRenderer (字幕渲染模块)
     // ==========================================
     const SubtitleRenderer = (function() {
         let _container = null;
@@ -646,7 +808,7 @@
     })();
 
     // ==========================================
-    // 模块 6: UI Manager (界面管理)
+    // 模块 7: UI Manager (界面管理)
     // ==========================================
     const UIManager = (function() {
         let _container = null;
@@ -937,8 +1099,20 @@
                     }
                     
                     console.log('[UIManager] 字幕未缓存，调用 API 识别');
-                    _updateStatus('上传腾讯云识别中...');
-                    srt = await AISubtitleService.transcribe(cachedItem.blob);
+                    
+                    // 显示文件大小信息
+                    const fileSizeMB = (cachedItem.blob.size / 1024 / 1024).toFixed(1);
+                    _updateStatus(`准备识别 (${fileSizeMB}MB)...`);
+                    
+                    srt = await AISubtitleService.transcribe(cachedItem.blob, (progress) => {
+                        if (progress.type === 'compress') {
+                            _updateStatus(progress.message);
+                        } else if (progress.type === 'compress_done') {
+                            _updateStatus(progress.message);
+                        } else if (progress.type === 'upload') {
+                            _updateStatus(progress.message);
+                        }
+                    });
                     
                     // 保存字幕到缓存
                     _updateStatus('正在保存字幕到缓存...');
