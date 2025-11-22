@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站自动字幕
 // @namespace    http://tampermonkey.net/
-// @version      0.2.1
-// @description  为B站视频自动生成字幕，支持提取音频、AI识别、字幕缓存和字幕显示
+// @version      0.3.0
+// @description  为B站视频自动生成字幕，支持提取音频、AI识别（腾讯云/阿里云）、字幕缓存和字幕显示
 // @author       You
 // @match        https://www.bilibili.com/video/*
 // @icon         https://www.bilibili.com/favicon.ico
@@ -24,17 +24,39 @@
         const CONFIG_KEY = 'bili_subtitle_config';
         
         const DEFAULT_CONFIG = {
-            APPID: "",
-            SECRET_ID: "",
-            SECRET_KEY: "",
-            ENGINE_TYPE: "16k_zh"
+            provider: "tencent", // tencent 或 alibaba
+            tencent: {
+                APPID: "",
+                SECRET_ID: "",
+                SECRET_KEY: "",
+                ENGINE_TYPE: "16k_zh"
+            },
+            alibaba: {
+                ACCESS_KEY_ID: "",
+                ACCESS_KEY_SECRET: "",
+                APP_KEY: ""
+            }
         };
 
         return {
             get: function() {
                 const saved = GM_getValue(CONFIG_KEY, null);
                 if (saved) {
-                    return JSON.parse(saved);
+                    const config = JSON.parse(saved);
+                    // 迁移旧版本配置
+                    if (config.APPID && !config.provider) {
+                        return {
+                            provider: "tencent",
+                            tencent: {
+                                APPID: config.APPID,
+                                SECRET_ID: config.SECRET_ID,
+                                SECRET_KEY: config.SECRET_KEY,
+                                ENGINE_TYPE: config.ENGINE_TYPE || "16k_zh"
+                            },
+                            alibaba: DEFAULT_CONFIG.alibaba
+                        };
+                    }
+                    return config;
                 }
                 return DEFAULT_CONFIG;
             },
@@ -45,18 +67,39 @@
 
             isConfigured: function() {
                 const config = this.get();
-                return !!(config.APPID && config.SECRET_ID && config.SECRET_KEY);
+                if (config.provider === 'tencent') {
+                    return !!(config.tencent.APPID && config.tencent.SECRET_ID && config.tencent.SECRET_KEY);
+                } else if (config.provider === 'alibaba') {
+                    return !!(config.alibaba.ACCESS_KEY_ID && config.alibaba.ACCESS_KEY_SECRET && config.alibaba.APP_KEY);
+                }
+                return false;
             },
 
             validate: function(config) {
-                if (!config.APPID || !config.APPID.trim()) {
-                    return { valid: false, message: 'APPID 不能为空' };
+                if (!config.provider) {
+                    return { valid: false, message: '请选择服务提供商' };
                 }
-                if (!config.SECRET_ID || !config.SECRET_ID.trim()) {
-                    return { valid: false, message: 'SECRET_ID 不能为空' };
-                }
-                if (!config.SECRET_KEY || !config.SECRET_KEY.trim()) {
-                    return { valid: false, message: 'SECRET_KEY 不能为空' };
+                
+                if (config.provider === 'tencent') {
+                    if (!config.tencent.APPID || !config.tencent.APPID.trim()) {
+                        return { valid: false, message: '腾讯云 APPID 不能为空' };
+                    }
+                    if (!config.tencent.SECRET_ID || !config.tencent.SECRET_ID.trim()) {
+                        return { valid: false, message: '腾讯云 SECRET_ID 不能为空' };
+                    }
+                    if (!config.tencent.SECRET_KEY || !config.tencent.SECRET_KEY.trim()) {
+                        return { valid: false, message: '腾讯云 SECRET_KEY 不能为空' };
+                    }
+                } else if (config.provider === 'alibaba') {
+                    if (!config.alibaba.ACCESS_KEY_ID || !config.alibaba.ACCESS_KEY_ID.trim()) {
+                        return { valid: false, message: '阿里云 ACCESS_KEY_ID 不能为空' };
+                    }
+                    if (!config.alibaba.ACCESS_KEY_SECRET || !config.alibaba.ACCESS_KEY_SECRET.trim()) {
+                        return { valid: false, message: '阿里云 ACCESS_KEY_SECRET 不能为空' };
+                    }
+                    if (!config.alibaba.APP_KEY || !config.alibaba.APP_KEY.trim()) {
+                        return { valid: false, message: '阿里云 APP_KEY 不能为空' };
+                    }
                 }
                 return { valid: true };
             }
@@ -301,7 +344,7 @@
             
             transcribe: async function(audioBlob) {
                 // 从 ConfigManager 读取配置
-                const config = ConfigManager.get();
+                const config = ConfigManager.get().tencent;
                 
                 const timestamp = Math.floor(Date.now() / 1000);
                 const params = {
@@ -328,9 +371,9 @@
                 const urlPath = `/asr/flash/v1/${config.APPID}`;
                 const signStr = `POST${urlHost}${urlPath}?${queryStr}`;
 
-                console.log('[AISubtitleService] 签名原文:', signStr);
+                console.log('[TencentCloud] 签名原文:', signStr);
                 const signature = HmacSha1(config.SECRET_KEY, signStr);
-                console.log('[AISubtitleService] 签名结果:', signature);
+                console.log('[TencentCloud] 签名结果:', signature);
                 
                 const requestUrl = `https://${urlHost}${urlPath}?${queryStr}`;
                 
@@ -434,15 +477,278 @@
             }
         };
 
-        let _currentProvider = TencentCloudProvider; 
+        // 阿里云 ASR 提供者
+        const AlibabaCloudProvider = {
+            name: 'alibaba',
+            
+            transcribe: async function(audioBlob) {
+                // 从 ConfigManager 读取配置
+                const config = ConfigManager.get().alibaba;
+                
+                // 第一步：提交识别任务
+                const taskId = await this._submitTask(audioBlob, config);
+                console.log('[AlibabaCloud] 任务ID:', taskId);
+                
+                // 第二步：轮询获取结果
+                const result = await this._pollResult(taskId, config);
+                
+                // 第三步：转换为 SRT 格式
+                return this._jsonToSrt(result);
+            },
+            
+            _submitTask: async function(audioBlob, config) {
+                // 将音频转换为 base64
+                const base64Audio = await this._blobToBase64(audioBlob);
+                
+                const timestamp = new Date().toISOString();
+                const nonce = this._generateNonce();
+                
+                const params = {
+                    AccessKeyId: config.ACCESS_KEY_ID,
+                    Action: 'SubmitTask',
+                    Format: 'JSON',
+                    SignatureMethod: 'HMAC-SHA1',
+                    SignatureNonce: nonce,
+                    SignatureVersion: '1.0',
+                    Timestamp: timestamp,
+                    Version: '2019-08-23'
+                };
+                
+                const body = JSON.stringify({
+                    app_key: config.APP_KEY,
+                    file_link: base64Audio,
+                    version: '4.0',
+                    enable_words: true
+                });
+                
+                const signature = this._generateSignature('POST', params, config.ACCESS_KEY_SECRET, body);
+                params.Signature = signature;
+                
+                const queryString = Object.keys(params).map(k => 
+                    `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`
+                ).join('&');
+                
+                const url = `https://nls-meta.cn-shanghai.aliyuncs.com/?${queryString}`;
+                
+                return new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method: 'POST',
+                        url: url,
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        data: body,
+                        onload: (response) => {
+                            if (response.status === 200) {
+                                try {
+                                    const resData = JSON.parse(response.responseText);
+                                    if (resData.TaskId) {
+                                        resolve(resData.TaskId);
+                                    } else {
+                                        reject(new Error(`阿里云 API 错误: ${resData.Message || '未知错误'}`));
+                                    }
+                                } catch (e) {
+                                    reject(new Error('解析响应失败: ' + e.message));
+                                }
+                            } else {
+                                reject(new Error(`请求失败: ${response.status} ${response.statusText}`));
+                            }
+                        },
+                        onerror: (err) => reject(new Error('网络错误'))
+                    });
+                });
+            },
+            
+            _pollResult: async function(taskId, config, maxAttempts = 60, interval = 2000) {
+                for (let i = 0; i < maxAttempts; i++) {
+                    await new Promise(resolve => setTimeout(resolve, interval));
+                    
+                    const timestamp = new Date().toISOString();
+                    const nonce = this._generateNonce();
+                    
+                    const params = {
+                        AccessKeyId: config.ACCESS_KEY_ID,
+                        Action: 'GetTaskResult',
+                        Format: 'JSON',
+                        SignatureMethod: 'HMAC-SHA1',
+                        SignatureNonce: nonce,
+                        SignatureVersion: '1.0',
+                        TaskId: taskId,
+                        Timestamp: timestamp,
+                        Version: '2019-08-23'
+                    };
+                    
+                    const signature = this._generateSignature('GET', params, config.ACCESS_KEY_SECRET);
+                    params.Signature = signature;
+                    
+                    const queryString = Object.keys(params).map(k => 
+                        `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`
+                    ).join('&');
+                    
+                    const url = `https://nls-meta.cn-shanghai.aliyuncs.com/?${queryString}`;
+                    
+                    try {
+                        const result = await new Promise((resolve, reject) => {
+                            GM_xmlhttpRequest({
+                                method: 'GET',
+                                url: url,
+                                onload: (response) => {
+                                    if (response.status === 200) {
+                                        resolve(JSON.parse(response.responseText));
+                                    } else {
+                                        reject(new Error(`请求失败: ${response.status}`));
+                                    }
+                                },
+                                onerror: reject
+                            });
+                        });
+                        
+                        if (result.StatusText === 'SUCCESS') {
+                            return JSON.parse(result.Result);
+                        } else if (result.StatusText === 'RUNNING' || result.StatusText === 'QUEUEING') {
+                            console.log(`[AlibabaCloud] 识别中... (${i+1}/${maxAttempts})`);
+                            continue;
+                        } else {
+                            throw new Error(`识别失败: ${result.StatusText}`);
+                        }
+                    } catch (e) {
+                        if (i === maxAttempts - 1) throw e;
+                    }
+                }
+                throw new Error('识别超时');
+            },
+            
+            _generateSignature: function(method, params, secretKey, body = '') {
+                // 1. 参数排序
+                const sortedKeys = Object.keys(params).sort();
+                const canonicalizedQueryString = sortedKeys
+                    .map(k => `${this._percentEncode(k)}=${this._percentEncode(params[k])}`)
+                    .join('&');
+                
+                // 2. 构造待签名字符串
+                const stringToSign = `${method}&${this._percentEncode('/')}&${this._percentEncode(canonicalizedQueryString)}`;
+                
+                // 3. 计算签名
+                const signature = HmacSha1(secretKey + '&', stringToSign);
+                
+                console.log('[AlibabaCloud] 签名原文:', stringToSign);
+                console.log('[AlibabaCloud] 签名结果:', signature);
+                
+                return signature;
+            },
+            
+            _percentEncode: function(str) {
+                return encodeURIComponent(str)
+                    .replace(/\!/g, '%21')
+                    .replace(/\'/g, '%27')
+                    .replace(/\(/g, '%28')
+                    .replace(/\)/g, '%29')
+                    .replace(/\*/g, '%2A');
+            },
+            
+            _generateNonce: function() {
+                return Math.random().toString(36).substring(2) + Date.now().toString(36);
+            },
+            
+            _blobToBase64: function(blob) {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        const base64 = reader.result.split(',')[1];
+                        resolve(`data:audio/m4a;base64,${base64}`);
+                    };
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+            },
+            
+            _jsonToSrt: function(result) {
+                let srt = '';
+                let index = 1;
+                
+                if (result.Sentences && result.Sentences.length > 0) {
+                    const sentences = result.Sentences;
+                    
+                    for (const sentence of sentences) {
+                        // 使用词级信息进行更精细的断句
+                        if (sentence.Words && sentence.Words.length > 0) {
+                            let currentSegment = [];
+                            let currentLength = 0;
+                            const MAX_CHARS = 20;
+                            const PUNCTUATION = /[，。！？；：、,.;:?!]/;
+                            
+                            for (let i = 0; i < sentence.Words.length; i++) {
+                                const wordObj = sentence.Words[i];
+                                const word = wordObj.Word;
+                                
+                                currentSegment.push(wordObj);
+                                currentLength += word.length;
+                                
+                                const isPunctuation = PUNCTUATION.test(word);
+                                const isOverLength = currentLength >= MAX_CHARS;
+                                const isLastWord = i === sentence.Words.length - 1;
+                                let isPause = false;
+                                
+                                if (!isLastWord) {
+                                    const nextWord = sentence.Words[i + 1];
+                                    if (nextWord.BeginTime - wordObj.EndTime > 500) {
+                                        isPause = true;
+                                    }
+                                }
+                                
+                                if (isPunctuation || isOverLength || isPause || isLastWord) {
+                                    if (currentSegment.length > 0) {
+                                        const startTime = formatTime(currentSegment[0].BeginTime);
+                                        const endTime = formatTime(currentSegment[currentSegment.length - 1].EndTime);
+                                        const text = currentSegment.map(w => w.Word).join('');
+                                        
+                                        srt += `${index}\n${startTime} --> ${endTime}\n${text}\n\n`;
+                                        index++;
+                                        
+                                        currentSegment = [];
+                                        currentLength = 0;
+                                    }
+                                }
+                            }
+                        } else {
+                            // 没有词级信息，使用句子级别
+                            const startTime = formatTime(sentence.BeginTime);
+                            const endTime = formatTime(sentence.EndTime);
+                            const text = sentence.Text;
+                            
+                            srt += `${index}\n${startTime} --> ${endTime}\n${text}\n\n`;
+                            index++;
+                        }
+                    }
+                }
+                
+                return srt;
+            }
+        };
 
         return {
             transcribe: async function(audioBlob) {
-                if (!_currentProvider) throw new Error('未设置 AI 提供者');
-                if (!ConfigManager.isConfigured()) {
-                    throw new Error('请先配置腾讯云 API 密钥');
+                const config = ConfigManager.get();
+                
+                // 选择提供者
+                let provider;
+                if (config.provider === 'alibaba') {
+                    provider = AlibabaCloudProvider;
+                } else {
+                    provider = TencentCloudProvider;
                 }
-                return _currentProvider.transcribe(audioBlob);
+                
+                if (!ConfigManager.isConfigured()) {
+                    const providerName = config.provider === 'alibaba' ? '阿里云' : '腾讯云';
+                    throw new Error(`请先配置${providerName} API 密钥`);
+                }
+                
+                return provider.transcribe(audioBlob);
+            },
+            
+            getProviderName: function() {
+                const config = ConfigManager.get();
+                return config.provider === 'alibaba' ? '阿里云' : '腾讯云';
             }
         };
     })();
@@ -659,8 +965,9 @@
 
         function _createConfigModal() {
             if (_configModal) {
-                _configModal.style.display = 'flex';
-                return;
+                // 如果模态框已存在，移除它并重新创建以更新配置值
+                _configModal.remove();
+                _configModal = null;
             }
 
             _configModal = document.createElement('div');
@@ -674,79 +981,188 @@
             const panel = document.createElement('div');
             panel.style.cssText = `
                 background: white; padding: 25px; border-radius: 12px;
-                width: 450px; max-width: 90vw; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+                width: 500px; max-width: 90vw; max-height: 90vh; overflow-y: auto;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
             `;
 
             const title = document.createElement('h2');
-            title.innerText = '腾讯云 API 配置';
+            title.innerText = 'AI 服务配置';
             title.style.cssText = 'margin: 0 0 20px 0; font-size: 20px; color: #333;';
             panel.appendChild(title);
 
             const config = ConfigManager.get();
 
+            // 服务提供商选择
+            const providerLabel = document.createElement('label');
+            providerLabel.innerText = '选择服务提供商:';
+            providerLabel.style.cssText = 'display: block; margin-bottom: 5px; font-size: 14px; color: #666; font-weight: bold;';
+            panel.appendChild(providerLabel);
+
+            const providerSelect = document.createElement('select');
+            providerSelect.style.cssText = `
+                width: 100%; padding: 10px; margin-bottom: 20px;
+                border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
+                box-sizing: border-box; cursor: pointer;
+            `;
+            providerSelect.innerHTML = `
+                <option value="tencent" ${config.provider === 'tencent' ? 'selected' : ''}>腾讯云 ASR</option>
+                <option value="alibaba" ${config.provider === 'alibaba' ? 'selected' : ''}>阿里云 ASR</option>
+            `;
+            panel.appendChild(providerSelect);
+
+            // 腾讯云配置容器
+            const tencentContainer = document.createElement('div');
+            tencentContainer.style.display = config.provider === 'tencent' ? 'block' : 'none';
+            
+            const tencentTitle = document.createElement('h3');
+            tencentTitle.innerText = '腾讯云配置';
+            tencentTitle.style.cssText = 'margin: 15px 0 10px 0; font-size: 16px; color: #00a1d6;';
+            tencentContainer.appendChild(tencentTitle);
+
             // APPID
             const appidLabel = document.createElement('label');
             appidLabel.innerText = 'APPID:';
             appidLabel.style.cssText = 'display: block; margin-bottom: 5px; font-size: 14px; color: #666;';
-            panel.appendChild(appidLabel);
+            tencentContainer.appendChild(appidLabel);
 
             const appidInput = document.createElement('input');
             appidInput.type = 'text';
-            appidInput.value = config.APPID || '';
+            appidInput.value = config.tencent.APPID || '';
             appidInput.placeholder = '请输入腾讯云 APPID';
             appidInput.style.cssText = `
                 width: 100%; padding: 10px; margin-bottom: 15px;
                 border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
                 box-sizing: border-box;
             `;
-            panel.appendChild(appidInput);
+            tencentContainer.appendChild(appidInput);
 
             // SECRET_ID
             const sidLabel = document.createElement('label');
             sidLabel.innerText = 'SECRET_ID:';
             sidLabel.style.cssText = 'display: block; margin-bottom: 5px; font-size: 14px; color: #666;';
-            panel.appendChild(sidLabel);
+            tencentContainer.appendChild(sidLabel);
 
             const sidInput = document.createElement('input');
             sidInput.type = 'text';
-            sidInput.value = config.SECRET_ID || '';
+            sidInput.value = config.tencent.SECRET_ID || '';
             sidInput.placeholder = '请输入 SECRET_ID';
             sidInput.style.cssText = `
                 width: 100%; padding: 10px; margin-bottom: 15px;
                 border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
                 box-sizing: border-box;
             `;
-            panel.appendChild(sidInput);
+            tencentContainer.appendChild(sidInput);
 
             // SECRET_KEY
             const skeyLabel = document.createElement('label');
             skeyLabel.innerText = 'SECRET_KEY:';
             skeyLabel.style.cssText = 'display: block; margin-bottom: 5px; font-size: 14px; color: #666;';
-            panel.appendChild(skeyLabel);
+            tencentContainer.appendChild(skeyLabel);
 
             const skeyInput = document.createElement('input');
             skeyInput.type = 'password';
-            skeyInput.value = config.SECRET_KEY || '';
+            skeyInput.value = config.tencent.SECRET_KEY || '';
             skeyInput.placeholder = '请输入 SECRET_KEY';
             skeyInput.style.cssText = `
                 width: 100%; padding: 10px; margin-bottom: 15px;
                 border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
                 box-sizing: border-box;
             `;
-            panel.appendChild(skeyInput);
+            tencentContainer.appendChild(skeyInput);
 
-            // 提示信息
-            const hint = document.createElement('div');
-            hint.innerHTML = `
-                <p style="font-size: 12px; color: #999; margin: 0 0 15px 0;">
-                    💡 获取密钥：访问 <a href="https://console.cloud.tencent.com/cam/capi" target="_blank" style="color: #00a1d6;">腾讯云控制台</a>
+            // 腾讯云提示信息
+            const tencentHint = document.createElement('div');
+            tencentHint.innerHTML = `
+                <p style="font-size: 12px; color: #999; margin: 0;">
+                    💡 获取密钥：<a href="https://console.cloud.tencent.com/cam/capi" target="_blank" style="color: #00a1d6;">腾讯云控制台</a>
                 </p>
             `;
-            panel.appendChild(hint);
+            tencentContainer.appendChild(tencentHint);
+
+            panel.appendChild(tencentContainer);
+
+            // 阿里云配置容器
+            const alibabaContainer = document.createElement('div');
+            alibabaContainer.style.display = config.provider === 'alibaba' ? 'block' : 'none';
+            
+            const alibabaTitle = document.createElement('h3');
+            alibabaTitle.innerText = '阿里云配置';
+            alibabaTitle.style.cssText = 'margin: 15px 0 10px 0; font-size: 16px; color: #ff6a00;';
+            alibabaContainer.appendChild(alibabaTitle);
+
+            // ACCESS_KEY_ID
+            const akIdLabel = document.createElement('label');
+            akIdLabel.innerText = 'ACCESS_KEY_ID:';
+            akIdLabel.style.cssText = 'display: block; margin-bottom: 5px; font-size: 14px; color: #666;';
+            alibabaContainer.appendChild(akIdLabel);
+
+            const akIdInput = document.createElement('input');
+            akIdInput.type = 'text';
+            akIdInput.value = config.alibaba.ACCESS_KEY_ID || '';
+            akIdInput.placeholder = '请输入 ACCESS_KEY_ID';
+            akIdInput.style.cssText = `
+                width: 100%; padding: 10px; margin-bottom: 15px;
+                border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
+                box-sizing: border-box;
+            `;
+            alibabaContainer.appendChild(akIdInput);
+
+            // ACCESS_KEY_SECRET
+            const akSecretLabel = document.createElement('label');
+            akSecretLabel.innerText = 'ACCESS_KEY_SECRET:';
+            akSecretLabel.style.cssText = 'display: block; margin-bottom: 5px; font-size: 14px; color: #666;';
+            alibabaContainer.appendChild(akSecretLabel);
+
+            const akSecretInput = document.createElement('input');
+            akSecretInput.type = 'password';
+            akSecretInput.value = config.alibaba.ACCESS_KEY_SECRET || '';
+            akSecretInput.placeholder = '请输入 ACCESS_KEY_SECRET';
+            akSecretInput.style.cssText = `
+                width: 100%; padding: 10px; margin-bottom: 15px;
+                border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
+                box-sizing: border-box;
+            `;
+            alibabaContainer.appendChild(akSecretInput);
+
+            // APP_KEY
+            const appKeyLabel = document.createElement('label');
+            appKeyLabel.innerText = 'APP_KEY:';
+            appKeyLabel.style.cssText = 'display: block; margin-bottom: 5px; font-size: 14px; color: #666;';
+            alibabaContainer.appendChild(appKeyLabel);
+
+            const appKeyInput = document.createElement('input');
+            appKeyInput.type = 'text';
+            appKeyInput.value = config.alibaba.APP_KEY || '';
+            appKeyInput.placeholder = '请输入 APP_KEY';
+            appKeyInput.style.cssText = `
+                width: 100%; padding: 10px; margin-bottom: 15px;
+                border: 1px solid #ddd; border-radius: 4px; font-size: 14px;
+                box-sizing: border-box;
+            `;
+            alibabaContainer.appendChild(appKeyInput);
+
+            // 阿里云提示信息
+            const alibabaHint = document.createElement('div');
+            alibabaHint.innerHTML = `
+                <p style="font-size: 12px; color: #999; margin: 0;">
+                    💡 获取密钥：<a href="https://ram.console.aliyun.com/manage/ak" target="_blank" style="color: #ff6a00;">阿里云AccessKey管理</a><br/>
+                    💡 创建项目：<a href="https://nls-portal.console.aliyun.com/applist" target="_blank" style="color: #ff6a00;">智能语音交互控制台</a>
+                </p>
+            `;
+            alibabaContainer.appendChild(alibabaHint);
+
+            panel.appendChild(alibabaContainer);
+
+            // 服务商切换事件
+            providerSelect.onchange = () => {
+                const selectedProvider = providerSelect.value;
+                tencentContainer.style.display = selectedProvider === 'tencent' ? 'block' : 'none';
+                alibabaContainer.style.display = selectedProvider === 'alibaba' ? 'block' : 'none';
+            };
 
             // 按钮容器
             const btnContainer = document.createElement('div');
-            btnContainer.style.cssText = 'display: flex; gap: 10px;';
+            btnContainer.style.cssText = 'display: flex; gap: 10px; margin-top: 20px;';
 
             const saveBtn = document.createElement('button');
             saveBtn.innerText = '保存';
@@ -756,10 +1172,18 @@
             `;
             saveBtn.onclick = () => {
                 const newConfig = {
-                    APPID: appidInput.value.trim(),
-                    SECRET_ID: sidInput.value.trim(),
-                    SECRET_KEY: skeyInput.value.trim(),
-                    ENGINE_TYPE: "16k_zh"
+                    provider: providerSelect.value,
+                    tencent: {
+                        APPID: appidInput.value.trim(),
+                        SECRET_ID: sidInput.value.trim(),
+                        SECRET_KEY: skeyInput.value.trim(),
+                        ENGINE_TYPE: "16k_zh"
+                    },
+                    alibaba: {
+                        ACCESS_KEY_ID: akIdInput.value.trim(),
+                        ACCESS_KEY_SECRET: akSecretInput.value.trim(),
+                        APP_KEY: appKeyInput.value.trim()
+                    }
                 };
 
                 const validation = ConfigManager.validate(newConfig);
@@ -854,7 +1278,7 @@
             if (!ConfigManager.isConfigured()) {
                 setTimeout(() => {
                     _createConfigModal();
-                    alert('欢迎使用 B 站自动字幕！\n请先配置腾讯云 API 密钥。');
+                    alert('欢迎使用 B 站自动字幕！\n请先配置 AI 服务密钥（支持腾讯云/阿里云）。');
                 }, 500);
             } else {
                 _checkStatus();
@@ -866,13 +1290,14 @@
                 _currentVideoId = AudioExtractor.getVideoId();
                 const cached = await CacheManager.get(_currentVideoId);
                 if (cached) {
+                    const providerName = AISubtitleService.getProviderName();
                     const hasSubtitle = await CacheManager.hasSubtitle(_currentVideoId);
                     if (hasSubtitle) {
                         _updateStatus(`已缓存音频+字幕 (${(cached.size / 1024 / 1024).toFixed(1)} MB)`);
                         _actionBtn.innerText = '加载字幕 (使用缓存)';
                     } else {
                         _updateStatus(`已缓存音频 (${(cached.size / 1024 / 1024).toFixed(1)} MB)`);
-                        _actionBtn.innerText = '生成字幕 (腾讯云 AI)';
+                        _actionBtn.innerText = `生成字幕 (${providerName} AI)`;
                     }
                     _actionBtn.onclick = _handleGenerateSubtitle;
                     _actionBtn.style.background = '#4caf50';
@@ -931,13 +1356,15 @@
                     // 没有缓存，需要调用 API 识别
                     // 检查配置
                     if (!ConfigManager.isConfigured()) {
-                        alert('请先配置腾讯云 API 密钥！');
+                        const providerName = AISubtitleService.getProviderName();
+                        alert(`请先配置${providerName} API 密钥！`);
                         _createConfigModal();
                         return;
                     }
                     
-                    console.log('[UIManager] 字幕未缓存，调用 API 识别');
-                    _updateStatus('上传腾讯云识别中...');
+                    const providerName = AISubtitleService.getProviderName();
+                    console.log(`[UIManager] 字幕未缓存，调用 ${providerName} API 识别`);
+                    _updateStatus(`上传${providerName}识别中...`);
                     srt = await AISubtitleService.transcribe(cachedItem.blob);
                     
                     // 保存字幕到缓存
