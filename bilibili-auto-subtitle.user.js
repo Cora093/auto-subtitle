@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站自动字幕
 // @namespace    http://tampermonkey.net/
-// @version      0.2.0
-// @description  为B站视频自动生成字幕，支持提取音频、AI识别和字幕显示
+// @version      0.2.1
+// @description  为B站视频自动生成字幕，支持提取音频、AI识别、字幕缓存和字幕显示
 // @author       You
 // @match        https://www.bilibili.com/video/*
 // @icon         https://www.bilibili.com/favicon.ico
@@ -206,7 +206,8 @@
                         blob: blob,
                         filename: filename,
                         timestamp: Date.now(),
-                        size: blob.size
+                        size: blob.size,
+                        subtitle: null // 初始化时字幕为空
                     };
                     store.put(record).onsuccess = () => resolve();
                 });
@@ -223,6 +224,43 @@
             
             has: async function(id) {
                 return !!(await this.get(id));
+            },
+            
+            // 保存字幕到缓存
+            saveSubtitle: async function(id, srtContent) {
+                const db = await _openDB();
+                return new Promise(async (resolve, reject) => {
+                    // 先获取现有记录
+                    const record = await this.get(id);
+                    if (!record) {
+                        reject(new Error('音频缓存不存在，无法保存字幕'));
+                        return;
+                    }
+                    
+                    // 更新字幕数据
+                    record.subtitle = srtContent;
+                    record.subtitleTimestamp = Date.now();
+                    
+                    const transaction = db.transaction([STORE_NAME], 'readwrite');
+                    const store = transaction.objectStore(STORE_NAME);
+                    store.put(record).onsuccess = () => {
+                        console.log('[CacheManager] 字幕已保存到缓存');
+                        resolve();
+                    };
+                    store.put(record).onerror = (e) => reject(e);
+                });
+            },
+            
+            // 获取缓存的字幕
+            getSubtitle: async function(id) {
+                const record = await this.get(id);
+                return record ? record.subtitle : null;
+            },
+            
+            // 检查是否有缓存的字幕
+            hasSubtitle: async function(id) {
+                const subtitle = await this.getSubtitle(id);
+                return !!(subtitle && subtitle.trim());
             }
         };
     })();
@@ -828,8 +866,14 @@
                 _currentVideoId = AudioExtractor.getVideoId();
                 const cached = await CacheManager.get(_currentVideoId);
                 if (cached) {
-                    _updateStatus(`已缓存 (${(cached.size / 1024 / 1024).toFixed(1)} MB)`);
-                    _actionBtn.innerText = '生成字幕 (腾讯云 AI)';
+                    const hasSubtitle = await CacheManager.hasSubtitle(_currentVideoId);
+                    if (hasSubtitle) {
+                        _updateStatus(`已缓存音频+字幕 (${(cached.size / 1024 / 1024).toFixed(1)} MB)`);
+                        _actionBtn.innerText = '加载字幕 (使用缓存)';
+                    } else {
+                        _updateStatus(`已缓存音频 (${(cached.size / 1024 / 1024).toFixed(1)} MB)`);
+                        _actionBtn.innerText = '生成字幕 (腾讯云 AI)';
+                    }
                     _actionBtn.onclick = _handleGenerateSubtitle;
                     _actionBtn.style.background = '#4caf50';
                     _actionBtn.disabled = false;
@@ -869,34 +913,49 @@
 
         async function _handleGenerateSubtitle() {
             try {
-                // 检查配置
-                if (!ConfigManager.isConfigured()) {
-                    alert('请先配置腾讯云 API 密钥！');
-                    _createConfigModal();
-                    return;
-                }
-
-                _updateStatus('正在读取缓存...');
+                _updateStatus('正在检查字幕缓存...');
                 _actionBtn.disabled = true;
 
                 const cachedItem = await CacheManager.get(_currentVideoId);
-                if (!cachedItem) throw new Error('缓存丢失');
+                if (!cachedItem) throw new Error('音频缓存丢失');
 
-                _updateStatus('上传腾讯云识别中...');
-                const srt = await AISubtitleService.transcribe(cachedItem.blob);
-
-                _updateStatus('识别成功，正在渲染...');
-                console.log('SRT Result:', srt);
+                // 检查是否有缓存的字幕
+                const cachedSubtitle = await CacheManager.getSubtitle(_currentVideoId);
+                let srt;
                 
+                if (cachedSubtitle) {
+                    console.log('[UIManager] 使用缓存的字幕');
+                    _updateStatus('使用缓存字幕，渲染中...');
+                    srt = cachedSubtitle;
+                } else {
+                    // 没有缓存，需要调用 API 识别
+                    // 检查配置
+                    if (!ConfigManager.isConfigured()) {
+                        alert('请先配置腾讯云 API 密钥！');
+                        _createConfigModal();
+                        return;
+                    }
+                    
+                    console.log('[UIManager] 字幕未缓存，调用 API 识别');
+                    _updateStatus('上传腾讯云识别中...');
+                    srt = await AISubtitleService.transcribe(cachedItem.blob);
+                    
+                    // 保存字幕到缓存
+                    _updateStatus('正在保存字幕到缓存...');
+                    await CacheManager.saveSubtitle(_currentVideoId, srt);
+                    _updateStatus('字幕已缓存');
+                }
+
+                console.log('SRT Result:', srt);
                 SubtitleRenderer.render(srt);
                 
-                _updateStatus('字幕已加载到播放器');
+                _updateStatus(cachedSubtitle ? '字幕已加载 (来自缓存)' : '字幕已加载 (已缓存)');
                 _actionBtn.innerText = '重新生成';
                 _updateToggleButton();
                 
             } catch (e) {
                 console.error(e);
-                _updateStatus(`API 错误: ${e.message}`);
+                _updateStatus(`错误: ${e.message}`);
                 if (e.message.includes('密钥') || e.message.includes('签名')) {
                     setTimeout(() => {
                         if (confirm('API 密钥可能有误，是否重新配置？')) {
